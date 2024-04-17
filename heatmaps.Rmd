@@ -1,0 +1,378 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r eval=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+# https://github.com/Bioconductor/bioconductor_docker/issues/22
+BiocManager::install("preprocessCore", configure.args="--disable-threading")
+BiocManager::install("edgeR")
+
+
+library(devtools)
+devtools::install_github("jokergoo/ComplexHeatmap")
+```
+
+```{r load_libraries}
+library(tidyverse)
+# library(preprocessCore)
+# library(edgeR)
+library(ComplexHeatmap)
+# require(magrittr)      # %>%
+# require(dplyr)         # mutate
+require(data.table)    # fread
+# require(R.utils)       # fread
+# 
+# library(tictoc)
+library(RColorBrewer)
+library(circlize)
+```
+
+
+```{r}
+##### sample_info #####
+
+sample_info <- data.frame(
+  region = rep(c("FCx", "Hp"), each = 10, times = 2),
+  treat = rep(c("Ctrl", "Dex"), each = 20),
+  replicate = rep(1:10, times = 4)
+)
+sample_info <- sample_info %>% mutate(id = paste(treat, "_", region, replicate, sep = ""))
+```
+
+```{r}
+# based on analysis.R
+
+filt_features <- readRDS('data/filt_features.RDS')
+filt_coverage <- readRDS('data/filt_coverage.RDS')
+filt_methylation <- readRDS('data/filt_methylation.RDS')
+
+### cpg islands ###
+
+cpg_ranges <- fread(
+  "data/cpg/cpg_sorted.bed",
+  header = F,
+  col.names = c("chromosome", "start", "stop"),
+  colClasses = c("character", "numeric", "numeric")
+)
+
+### genes ###
+
+genes_ranges <- fread(
+  "data/genes/mart-104-sorted.bed",
+  header = F,
+  col.names = c("chromosome", "start", "stop", "symbol", "id"),
+  colClasses = c("character", "numeric", "numeric", "character", "character")
+)
+
+# cpg_ranges$symbol = NA
+
+overlap <- function(x, genes_ranges) {
+  out <- genes_ranges[(genes_ranges$chromosome == x["chromosome"]) & ((genes_ranges$start - 2000) <= as.numeric(x["stop"])) & ((genes_ranges$stop + 2000) >= as.numeric(x["start"])),]
+  if (nrow(out) == 0) return(NA)
+  if (nrow(out) == 1) return(unlist(out$symbol))
+  xavg = (as.numeric(x["start"]) + as.numeric(x["stop"])) / 2
+  out <- out %>% mutate(distance = abs(xavg - round((start + stop) / 2))) %>% arrange(distance)
+  unlist(out[1,"symbol"])
+}
+cpg_ranges$symbol <- apply(cpg_ranges, 1, overlap, genes_ranges) 
+cpg_ranges <- cpg_ranges %>% filter(!is.na(symbol))
+
+summary_stat <- function(range, features, methylation) {
+  chromosome <- range["chromosome"]
+  start <- as.numeric(range["start"])
+  stop <- as.numeric(range["stop"])
+  wh <- which((features$chromosome == chromosome) & (features$position >= start) & (features$position <= stop))
+  rrbs_data <- methylation[wh,]
+  rrbs_features <- filt_features[wh,]$id
+  if (length(wh) < 10) {return(rep(NA, 7 + 40))}
+  if (dim(rrbs_data)[1] < 10) {return(rep(NA, 7 + 40))}
+  ### 
+  fcx_data <- rrbs_data[,sample_info$id[sample_info$region == "FCx"]]
+  hp_data <- rrbs_data[,sample_info$id[sample_info$region == "Hp"]]
+  rrbs_fcx <- as.vector(t(fcx_data))
+  rrbs_hp <- as.vector(t(hp_data))
+  rrbs_fcx_features <- rep(rrbs_features, each = sum(sample_info$region == "FCx"))
+  rrbs_hp_features <- rep(rrbs_features, each = sum(sample_info$region == "Hp"))
+  rrbs_fcx_treat <- rep(sample_info$treat[sample_info$region == "FCx"], length(wh))
+  rrbs_hp_treat <- rep(sample_info$treat[sample_info$region == "Hp"], length(wh))
+  p_fcx <- anova(aov(rrbs_fcx ~ rrbs_fcx_treat + rrbs_fcx_features))[1,5]
+  p_hp <- anova(aov(rrbs_hp ~ rrbs_hp_treat + rrbs_hp_features))[1,5]
+  mean_fcx <- data.frame(data = rrbs_fcx, treat = rrbs_fcx_treat, features = rrbs_fcx_features) %>% group_by(features,treat) %>% 
+    summarise(mean=mean(data), .groups = 'drop') %>% group_by(features) %>% 
+    summarise(fold_change = mean(mean[treat == "Dex"]) - mean(mean[treat == "Ctrl"]), .groups = 'drop') %>%
+    select(fold_change) %>% summarize(mean_col = mean(fold_change), sd_col = sd(fold_change)) %>%
+    ungroup() %>% unlist()
+  mean_hp <- data.frame(data = rrbs_hp, treat = rrbs_hp_treat, features = rrbs_hp_features) %>% group_by(features,treat) %>% 
+    summarise(mean=mean(data), .groups = 'drop') %>% group_by(features) %>% 
+    summarise(fold_change = mean(mean[treat == "Dex"]) - mean(mean[treat == "Ctrl"]), .groups = 'drop') %>%
+    select(fold_change) %>% summarize(mean_col = mean(fold_change), sd_col = sd(fold_change)) %>%
+    ungroup() %>% unlist()
+  out <- c(p_fcx, mean_fcx, p_hp, mean_hp, dim(rrbs_data)[1], apply(fcx_data, 2, mean), apply(hp_data, 2, mean))
+  out
+}
+
+cpg_summary <- t(apply(cpg_ranges, 1, summary_stat, filt_features, filt_methylation))
+colnames(cpg_summary) <- c(
+  "p_fcx", "diff_fcx", "diff_sd_fcx", "p_hp", "diff_hp", "diff_sd_hp", "n",
+  sample_info$id[sample_info$region == "FCx"], sample_info$id[sample_info$region == "Hp"]
+)
+cbind(cpg_ranges, cpg_summary) %>%
+  filter(!is.na(p_fcx)) %>% 
+  mutate(
+    fdr_fcx = p.adjust(p_fcx, method = "fdr"),
+    fdr_hp = p.adjust(p_hp, method = "fdr")
+  ) %>%
+  saveRDS('data/cpg-mean.RDS')
+```
+
+# FCx
+```{r}
+tiss <- 'FCx'
+fdr_th <- 0.05
+plot_data <- 
+  readRDS('data/cpg-mean.RDS') %>%
+  rename(fdr = !!paste0('fdr_', tolower(tiss))) %>%
+  select(symbol, fdr, filter(sample_info, region == tiss)$id) %>%
+  filter(fdr < fdr_th)
+
+go_genes <- list(
+  "cAMP signaling pathway" = c(
+    'Gabbr1', 'Gnas', 'Grin2c', 'Grin3b', 'Pde4c', 'Sstr2'
+  ),
+  "Tight junction" = c(
+    'Cldn4', 'Nedd4l', 'Pard6b', 'Runx1', 'Tjp3'
+  ),
+  "Calcium signaling pathway" = c(
+    'Gnas', 'Grin2c', 'Grm5', 'P2rx7', 'Ptger1', 'Ryr1', 'Tbxa2r'
+  ),
+  "Neuroactive ligand-receptor interaction" = c(
+    'Gabbr1', 'Galr1', 'Grin2c', 'Grin3b', 'Grm5', 'P2rx7', 'Ptger1', 'Sstr2', 'Tac4', 'Tbxa2r'
+  ),
+  "Wnt signaling pathway" = c(
+    'Apc2', 'Fzd5', 'Nlk', 'Sfrp2', 'Wnt1', 'Wnt10a'
+  ),
+  "Hippo signaling pathway" = c(
+    'Apc2', 'Cdh1', 'Fzd5', 'Pard6b', 'Wnt1', 'Wnt10a'
+  ),
+  "Signaling pathways regulating pluripotency of stem cells" = c(
+    'Apc2', 'Fzd5', 'Jak3', 'Lhx5', 'Wnt1', 'Wnt10a', 'Zfhx3'
+  )
+)
+plot_info <- 
+  sample_info %>%
+  filter(region == tiss)
+
+plot_data_genes <-
+  plot_data %>%
+  mutate(at = row_number()) %>%
+  filter(symbol %in% as.character(flatten(go_genes)))
+
+anno_data_right <-
+  plot_data %>%
+  transmute(
+    gene_name = symbol,
+  )
+for (go_name in names(go_genes)) {
+  anno_data_right <- mutate(
+      anno_data_right,
+      "{ go_name }" := if_else(toupper(gene_name) %in% toupper(go_genes[[go_name]]), 'sig', 'ns')
+    )
+}
+anno_data_right <- as.data.frame(anno_data_right)
+
+.x <-
+  plot_data %>%
+  select(any_of(sample_info$id)) %>%
+  as.matrix() %>%
+  { t(scale(t(.))) }
+rownames(.x) <- plot_data$gene_name
+.col_fun <- colorRamp2(
+  seq(-3, 3, length.out = 24),
+  rev(colorRampPalette(brewer.pal(11, "RdBu"))(24))
+)
+.right_annot_col <- list(
+      'fdr' = c('sig'='#15546a', 'ns'='white')
+)
+for (go_name in names(go_genes)) {
+  .right_annot_col[[go_name]] <- c('sig'='#CDC693', 'ns'='white')
+}
+```
+
+```{r draw_heatmap2, echo=FALSE, fig.align="center", fig.width=8, fig.height=12, results='asis', include=TRUE, warning=FALSE}
+svg(paste0('results/heatmap-DMIs-', tiss, '.svg'), width = 9, height = 11)
+ht_opt$ROW_ANNO_PADDING = unit(0.2, "cm")
+ht_opt$TITLE_PADDING = unit(0.4, "cm")
+h <- Heatmap(
+  .x,
+  column_title = paste('DEX effect in the frontal cortex (FDR <', format(fdr_th, scientific = FALSE), ')'),
+  cluster_columns = FALSE,
+  clustering_distance_rows = function(x) as.dist(1-cor(t(x))),
+  col = .col_fun,
+  show_row_names = FALSE,
+  show_column_names = FALSE,
+  row_names_side = 'right',
+  row_dend_width = unit(3, 'cm'),
+  row_split = 2,
+  column_names_rot = 45,
+  column_split = rep(1:2, each = 10),
+  top_annotation = c(
+    columnAnnotation(
+      treatment = as.character(plot_info$treat),
+      col = list(
+        'treatment' = c('Ctrl' = '#CAB2D6', 'Dex' = '#6A3D9A')
+      ),
+      show_annotation_name = FALSE,
+      show_legend = FALSE
+    )
+  ),
+  right_annotation = c(
+    rowAnnotation(
+      df = select(anno_data_right, -gene_name),
+      gap = unit(5, 'points'),
+      annotation_name_rot = 45,
+      col = .right_annot_col,
+      show_legend = FALSE
+    ),
+    rowAnnotation(
+      row_names = anno_mark(
+        at = plot_data_genes$at,
+        labels = plot_data_genes$symbol,
+      ),
+      gap = unit(5, 'points'),
+      annotation_name_rot = 45,
+      col = .right_annot_col,
+      show_legend = FALSE
+    )
+  ),
+  heatmap_legend_param = list(title = '', at = c(-3, -2, -1, 0, 1, 2, 3), legend_height = unit(3, 'cm')),
+)
+ComplexHeatmap::draw(h)
+decorate_annotation("treatment", {
+  grid.text(label = "Control", gp = gpar(col = "black", fontsize = 11))
+}, slice = 1
+)
+decorate_annotation("treatment", {
+  grid.text(label = "DEX", gp = gpar(col = "white", fontsize = 11))
+}, slice = 2
+)
+dev.off()
+```
+
+# Hp
+```{r}
+tiss <- 'Hp'
+plot_data <- 
+  readRDS('data/cpg-mean.RDS') %>%
+  rename(fdr = !!paste0('fdr_', tolower(tiss))) %>%
+  select(symbol, fdr, filter(sample_info, region == tiss)$id) %>%
+  filter(fdr < fdr_th)
+
+go_genes <- list(
+  'Calcium signaling pathway' = c('Gnas', 'Grin2c', 'Grm5', 'Orai1', 'P2rx7', 'Ryr1', 'Tbxa2r'),
+  'Signaling pathways regulating pluripotency of stem cells' = c('Apc2', 'Fzd2', 'Sox2', 'Tbx3', 'Zfhx3')
+)
+tiss <- 'Hp'
+plot_info <- 
+  sample_info %>%
+  filter(region == tiss)
+
+plot_data_genes <-
+  plot_data %>%
+  mutate(at = row_number()) %>%
+  filter(symbol %in% as.character(flatten(go_genes)))
+
+anno_data_right <-
+  plot_data %>%
+  transmute(
+    gene_name = symbol,
+  )
+for (go_name in names(go_genes)) {
+  anno_data_right <- mutate(
+      anno_data_right,
+      "{ go_name }" := if_else(toupper(gene_name) %in% toupper(go_genes[[go_name]]), 'sig', 'ns')
+    )
+}
+anno_data_right <- as.data.frame(anno_data_right)
+
+.x <-
+  plot_data %>%
+  select(any_of(sample_info$id)) %>%
+  as.matrix() %>%
+  { t(scale(t(.))) }
+rownames(.x) <- plot_data$gene_name
+.col_fun <- colorRamp2(
+  seq(-3, 3, length.out = 24),
+  rev(colorRampPalette(brewer.pal(11, "RdBu"))(24))
+)
+.right_annot_col <- list(
+      'fdr' = c('sig'='#15546a', 'ns'='white')
+)
+for (go_name in names(go_genes)) {
+  .right_annot_col[[go_name]] <- c('sig'='#CDC693', 'ns'='white')
+}
+```
+
+```{r draw_heatmap3, echo=FALSE, fig.align="center", fig.width=8, fig.height=12, results='asis', include=TRUE, warning=FALSE}
+svg(paste0('results/heatmap-DMIs-', tiss, '.svg'), width = 7.5, height = 11)
+ht_opt$ROW_ANNO_PADDING = unit(0.2, "cm")
+ht_opt$TITLE_PADDING = unit(0.4, "cm")
+h <- Heatmap(
+  .x,
+  column_title = paste('DEX effect in the hippocampus (FDR <', format(fdr_th, scientific = FALSE), ')'),
+  cluster_columns = FALSE,
+  clustering_distance_rows = function(x) as.dist(1-cor(t(x))),
+  col = .col_fun,
+  show_row_names = FALSE,
+  show_column_names = FALSE,
+  row_names_side = 'right',
+  row_dend_width = unit(3, 'cm'),
+  row_split = 2,
+  column_names_rot = 45,
+  column_split = rep(1:2, each = 10),
+  top_annotation = c(
+    columnAnnotation(
+      treatment = as.character(plot_info$treat),
+      col = list(
+        'treatment' = c('Ctrl' = '#CAB2D6', 'Dex' = '#6A3D9A')
+      ),
+      show_annotation_name = FALSE,
+      show_legend = FALSE
+    )
+  ),
+  right_annotation = c(
+    rowAnnotation(
+      df = select(anno_data_right, -gene_name),
+      gap = unit(5, 'points'),
+      annotation_name_rot = 45,
+      col = .right_annot_col,
+      show_legend = FALSE
+    ),
+    rowAnnotation(
+      row_names = anno_mark(
+        at = plot_data_genes$at,
+        labels = plot_data_genes$symbol,
+      ),
+      gap = unit(5, 'points'),
+      annotation_name_rot = 45,
+      col = .right_annot_col,
+      show_legend = FALSE
+    )
+  ),
+  heatmap_legend_param = list(title = '', at = c(-3, -2, -1, 0, 1, 2, 3), legend_height = unit(3, 'cm')),
+)
+ComplexHeatmap::draw(h)
+decorate_annotation("treatment", {
+  grid.text(label = "Control", gp = gpar(col = "black", fontsize = 11))
+}, slice = 1
+)
+decorate_annotation("treatment", {
+  grid.text(label = "DEX", gp = gpar(col = "white", fontsize = 11))
+}, slice = 2
+)
+dev.off()
+```

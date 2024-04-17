@@ -68,6 +68,11 @@ filt_features$id <- paste(filt_features$chromosome, filt_features$position, ifel
 filt_coverage <- data_coverage[data_min >= 10,]
 filt_methylation <- data_methylation[data_min >= 10,]
 
+# # save filtered data
+# saveRDS(filt_features, 'data/filt_features.RDS', compress = FALSE)
+# saveRDS(filt_coverage, 'data/filt_coverage.RDS', compress = FALSE)
+# saveRDS(filt_methylation, 'data/filt_methylation.RDS', compress = FALSE)
+
 ### basic stats ###
 summary <- function(x) {
   
